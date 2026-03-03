@@ -1,0 +1,77 @@
+version: "1.0"
+
+global:
+  log_level: info
+  max_concurrent_agents: 10
+  default_timeout: 300s
+
+providers:
+  claude:
+    api_key: ${ANTHROPIC_API_KEY}
+    models:
+      - id: claude-sonnet-4-6
+        role: lead
+        cost_per_1k_input: 0.003
+        cost_per_1k_output: 0.015
+        strengths:
+          - deep_reasoning
+          - code_review
+          - refactoring
+          - large_context
+      - id: claude-haiku-4-5
+        role: worker
+        cost_per_1k_input: 0.0008
+        cost_per_1k_output: 0.004
+        strengths:
+          - quick_task
+    cli:
+      enabled: false
+      path: claude
+
+  gemini:
+    api_key: ${GOOGLE_API_KEY}
+    models:
+      - id: gemini-2.5-pro
+        role: worker
+        cost_per_1k_input: 0.00125
+        cost_per_1k_output: 0.005
+        strengths:
+          - multimodal
+          - large_context
+          - code_generation
+        max_context: 2000000
+
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    models:
+      - id: gpt-4.1
+        role: worker
+        cost_per_1k_input: 0.002
+        cost_per_1k_output: 0.008
+        strengths:
+          - code_generation
+          - test_generation
+
+  ollama:
+    base_url: http://localhost:11434
+    models:
+      - id: qwen3:32b
+        role: worker
+        cost_per_1k_input: 0
+        cost_per_1k_output: 0
+        strengths:
+          - quick_task
+          - code_generation
+
+routing:
+  strategy: best_fit
+  fallback: claude
+  cost_limit:
+    daily: 50.00
+    per_task: 5.00
+
+communication:
+  bus: channel
+  mcp:
+    enabled: true
+    transport: stdio

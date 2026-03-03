@@ -1,0 +1,22 @@
+# GoTems 构建产物
+/bin/
+
+# Go
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 敏感文件
+.env
+*.key
+*.pem

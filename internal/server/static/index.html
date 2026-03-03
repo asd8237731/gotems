@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoTems Dashboard</title>
+<style>
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --border: #334155;
+    --text: #e2e8f0; --text2: #94a3b8; --accent: #3b82f6;
+    --green: #22c55e; --red: #ef4444; --yellow: #eab308; --purple: #a855f7;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 20px; font-weight: 700; }
+  .header .badge { background: var(--accent); color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 16px; padding: 24px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .card h2 { font-size: 14px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.green { background: var(--green); } .dot.red { background: var(--red); } .dot.yellow { background: var(--yellow); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--text2); padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 500; }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .status { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .status.idle { background: #166534; color: #86efac; }
+  .status.busy { background: #854d0e; color: #fde047; }
+  .status.error { background: #991b1b; color: #fca5a5; }
+  .status.stopped { background: #374151; color: #9ca3af; }
+  .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .stat { background: var(--bg); border-radius: 6px; padding: 12px; }
+  .stat .label { font-size: 11px; color: var(--text2); }
+  .stat .value { font-size: 24px; font-weight: 700; margin-top: 4px; }
+  .stat .value.cost { color: var(--green); }
+  .stat .value.tokens { color: var(--accent); }
+  .events { max-height: 300px; overflow-y: auto; font-size: 12px; }
+  .event { padding: 8px 12px; border-left: 3px solid var(--accent); margin-bottom: 4px; background: var(--bg); border-radius: 0 4px 4px 0; }
+  .event .time { color: var(--text2); margin-right: 8px; }
+  .event.task_started { border-left-color: var(--yellow); }
+  .event.task_completed { border-left-color: var(--green); }
+  .event.task_failed { border-left-color: var(--red); }
+  .prompt-box { display: flex; gap: 8px; margin-bottom: 16px; }
+  .prompt-box input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; color: var(--text); font-family: inherit; font-size: 13px; }
+  .prompt-box input:focus { outline: none; border-color: var(--accent); }
+  .prompt-box button { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 10px 20px; cursor: pointer; font-family: inherit; font-weight: 600; }
+  .prompt-box button:hover { background: #2563eb; }
+  .prompt-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .result-box { background: var(--bg); border-radius: 6px; padding: 16px; font-size: 13px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; line-height: 1.6; }
+  .full-width { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>GoTems</h1>
+  <span class="badge">Dashboard</span>
+  <span id="conn-status" style="margin-left:auto; font-size:12px; color:var(--text2)">connecting...</span>
+</div>
+
+<div class="grid">
+  <!-- 运行任务 -->
+  <div class="card full-width">
+    <h2><span class="dot green"></span> Run Task</h2>
+    <div class="prompt-box">
+      <input type="text" id="prompt" placeholder="输入任务描述..." onkeydown="if(event.key==='Enter')runTask()">
+      <select id="provider" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;color:var(--text);font-family:inherit;">
+        <option value="">Auto Route</option>
+        <option value="claude">Claude</option>
+        <option value="gemini">Gemini</option>
+        <option value="openai">OpenAI</option>
+        <option value="ollama">Ollama</option>
+      </select>
+      <button id="run-btn" onclick="runTask()">Run</button>
+    </div>
+    <div id="result" class="result-box" style="display:none;"></div>
+  </div>
+
+  <!-- Agents -->
+  <div class="card">
+    <h2><span class="dot green"></span> Agents</h2>
+    <table>
+      <thead><tr><th>ID</th><th>Provider</th><th>Model</th><th>Status</th></tr></thead>
+      <tbody id="agents-body"><tr><td colspan="4" style="color:var(--text2)">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Cost -->
+  <div class="card">
+    <h2><span class="dot yellow"></span> Cost Summary</h2>
+    <div class="stat-grid">
+      <div class="stat"><div class="label">Total Cost</div><div class="value cost" id="total-cost">$0.00</div></div>
+      <div class="stat"><div class="label">Requests</div><div class="value" id="total-requests">0</div></div>
+      <div class="stat"><div class="label">Tokens In</div><div class="value tokens" id="total-in">0</div></div>
+      <div class="stat"><div class="label">Tokens Out</div><div class="value tokens" id="total-out">0</div></div>
+    </div>
+  </div>
+
+  <!-- Events -->
+  <div class="card full-width">
+    <h2><span class="dot green"></span> Live Events</h2>
+    <div class="events" id="events"><div class="event">Waiting for events...</div></div>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+async function fetchJSON(path) {
+  try { const r = await fetch(API + path); return await r.json(); } catch(e) { return null; }
+}
+
+async function refreshAgents() {
+  const agents = await fetchJSON('/api/agents');
+  if (!agents) return;
+  const tbody = document.getElementById('agents-body');
+  tbody.innerHTML = agents.map(a => `<tr>
+    <td>${a.id}</td><td>${a.provider}</td><td>${a.model}</td>
+    <td><span class="status ${a.status}">${a.status}</span></td>
+  </tr>`).join('') || '<tr><td colspan="4">No agents</td></tr>';
+}
+
+async function refreshCost() {
+  const c = await fetchJSON('/api/cost');
+  if (!c || c.message) return;
+  document.getElementById('total-cost').textContent = '$' + (c.total_cost || 0).toFixed(4);
+  document.getElementById('total-requests').textContent = c.record_count || 0;
+  document.getElementById('total-in').textContent = (c.total_tokens_in || 0).toLocaleString();
+  document.getElementById('total-out').textContent = (c.total_tokens_out || 0).toLocaleString();
+}
+
+async function runTask() {
+  const prompt = document.getElementById('prompt').value.trim();
+  if (!prompt) return;
+  const provider = document.getElementById('provider').value;
+  const btn = document.getElementById('run-btn');
+  const resultBox = document.getElementById('result');
+  btn.disabled = true; btn.textContent = 'Running...';
+  resultBox.style.display = 'block'; resultBox.textContent = 'Executing...';
+  try {
+    const r = await fetch(API + '/api/run', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({prompt, provider: provider || undefined})
+    });
+    const data = await r.json();
+    if (data.error) { resultBox.textContent = 'Error: ' + data.error; }
+    else { resultBox.textContent = data.content || JSON.stringify(data, null, 2); }
+    refreshCost();
+  } catch(e) { resultBox.textContent = 'Request failed: ' + e.message; }
+  btn.disabled = false; btn.textContent = 'Run';
+}
+
+function connectSSE() {
+  const evtSource = new EventSource(API + '/api/events');
+  const status = document.getElementById('conn-status');
+  evtSource.onopen = () => { status.textContent = 'connected'; status.style.color = '#22c55e'; };
+  evtSource.onerror = () => { status.textContent = 'disconnected'; status.style.color = '#ef4444'; };
+  evtSource.addEventListener('connected', (e) => { addEvent('connected', JSON.parse(e.data)); });
+  evtSource.addEventListener('task_started', (e) => { addEvent('task_started', JSON.parse(e.data)); refreshAgents(); });
+  evtSource.addEventListener('task_completed', (e) => { addEvent('task_completed', JSON.parse(e.data)); refreshAgents(); refreshCost(); });
+  evtSource.addEventListener('task_failed', (e) => { addEvent('task_failed', JSON.parse(e.data)); refreshAgents(); });
+}
+
+function addEvent(type, data) {
+  const el = document.getElementById('events');
+  const time = new Date().toLocaleTimeString();
+  const msg = JSON.stringify(data.data || data);
+  el.innerHTML = `<div class="event ${type}"><span class="time">${time}</span><strong>${type}</strong> ${msg}</div>` + el.innerHTML;
+  if (el.children.length > 100) el.lastChild.remove();
+}
+
+refreshAgents(); refreshCost(); connectSSE();
+setInterval(refreshAgents, 5000);
+setInterval(refreshCost, 10000);
+</script>
+</body>
+</html>

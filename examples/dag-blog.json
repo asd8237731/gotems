@@ -1,0 +1,26 @@
+[
+  {
+    "id": "t1-design",
+    "prompt": "设计一个博客系统的数据库 Schema，包含用户、文章、评论、标签表，使用 PostgreSQL，输出 SQL DDL",
+    "tags": ["deep_reasoning", "code_generation"],
+    "depends_on": []
+  },
+  {
+    "id": "t2-api",
+    "prompt": "基于以下数据库设计，用 Go 实现博客系统的 RESTful API，包含 CRUD 接口",
+    "tags": ["code_generation"],
+    "depends_on": ["t1-design"]
+  },
+  {
+    "id": "t3-test",
+    "prompt": "为博客系统的 API 编写完整的单元测试和集成测试",
+    "tags": ["test_generation"],
+    "depends_on": ["t2-api"]
+  },
+  {
+    "id": "t4-review",
+    "prompt": "对博客系统的代码进行安全审查和代码质量审查，指出潜在问题",
+    "tags": ["code_review", "deep_reasoning"],
+    "depends_on": ["t2-api"]
+  }
+]
