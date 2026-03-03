@@ -21,7 +21,7 @@ import (
 	"github.com/lyymini/gotems/pkg/schema"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -311,21 +311,35 @@ func registerAgents(orch *orchestrator.Orchestrator, cfg *config.Config, args ma
 		if len(cfg.Providers.Gemini.Models) > 0 {
 			model = cfg.Providers.Gemini.Models[0].ID
 		}
-		orch.RegisterAgent(agent.NewGeminiAgent("gemini-1", logger,
+		geminiOpts := []agent.GeminiOption{
 			agent.WithGeminiAPIKey(cfg.Providers.Gemini.APIKey),
 			agent.WithGeminiModel(model),
-		))
+		}
+		if cfg.Providers.Gemini.CLI != nil && cfg.Providers.Gemini.CLI.Enabled {
+			geminiOpts = append(geminiOpts, agent.WithGeminiMode(agent.GeminiModeCLI))
+			if cfg.Providers.Gemini.CLI.Path != "" {
+				geminiOpts = append(geminiOpts, agent.WithGeminiCLIPath(cfg.Providers.Gemini.CLI.Path))
+			}
+		}
+		orch.RegisterAgent(agent.NewGeminiAgent("gemini-1", logger, geminiOpts...))
 	}
 
 	if cfg.Providers.OpenAI != nil && (specified == "" || specified == "openai") {
-		model := "gpt-4.1"
+		model := "gpt-4o"
 		if len(cfg.Providers.OpenAI.Models) > 0 {
 			model = cfg.Providers.OpenAI.Models[0].ID
 		}
-		orch.RegisterAgent(agent.NewOpenAIAgent("openai-1", logger,
+		openaiOpts := []agent.OpenAIOption{
 			agent.WithOpenAIAPIKey(cfg.Providers.OpenAI.APIKey),
 			agent.WithOpenAIModel(model),
-		))
+		}
+		if cfg.Providers.OpenAI.CLI != nil && cfg.Providers.OpenAI.CLI.Enabled {
+			openaiOpts = append(openaiOpts, agent.WithOpenAIMode(agent.OpenAIModeCLI))
+			if cfg.Providers.OpenAI.CLI.Path != "" {
+				openaiOpts = append(openaiOpts, agent.WithOpenAICLIPath(cfg.Providers.OpenAI.CLI.Path))
+			}
+		}
+		orch.RegisterAgent(agent.NewOpenAIAgent("openai-1", logger, openaiOpts...))
 	}
 
 	if cfg.Providers.Ollama != nil && (specified == "" || specified == "ollama") {

@@ -40,17 +40,23 @@ providers:
           - large_context
           - code_generation
         max_context: 2000000
+    cli:
+      enabled: false
+      path: gemini
 
   openai:
     api_key: ${OPENAI_API_KEY}
     models:
-      - id: gpt-4.1
+      - id: gpt-4o
         role: worker
         cost_per_1k_input: 0.002
         cost_per_1k_output: 0.008
         strengths:
           - code_generation
           - test_generation
+    cli:
+      enabled: false
+      path: codex
 
   ollama:
     base_url: http://localhost:11434

@@ -8,24 +8,47 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/lyymini/gotems/internal/process"
+	"github.com/lyymini/gotems/internal/session"
 	"github.com/lyymini/gotems/internal/task"
 	"github.com/lyymini/gotems/pkg/schema"
 )
 
-// OpenAIAgent 是 OpenAI 的适配器
+// OpenAIMode 定义 OpenAI 的运行模式
+type OpenAIMode int
+
+const (
+	OpenAIModeAPI OpenAIMode = iota // 通过 OpenAI API 调用
+	OpenAIModeCLI                   // 通过 codex / opencode CLI 子进程调用
+)
+
+// OpenAIAgent 是 OpenAI 的适配器，支持 API 和 CLI 双模式
 type OpenAIAgent struct {
 	BaseAgent
-	apiKey     string
-	httpClient *http.Client
-	logger     *slog.Logger
+	apiKey       string
+	mode         OpenAIMode
+	cliPath      string     // codex / opencode CLI 路径
+	autoApprove  bool
+	httpClient   *http.Client
+	sessionStore *session.Store
+	procManager  *process.Manager
+	logger       *slog.Logger
 }
 
 type OpenAIOption func(*OpenAIAgent)
 
-func WithOpenAIAPIKey(key string) OpenAIOption { return func(a *OpenAIAgent) { a.apiKey = key } }
-func WithOpenAIModel(m string) OpenAIOption    { return func(a *OpenAIAgent) { a.ModelID = m } }
+func WithOpenAIAPIKey(key string) OpenAIOption    { return func(a *OpenAIAgent) { a.apiKey = key } }
+func WithOpenAIModel(m string) OpenAIOption       { return func(a *OpenAIAgent) { a.ModelID = m } }
+func WithOpenAIMode(m OpenAIMode) OpenAIOption    { return func(a *OpenAIAgent) { a.mode = m } }
+func WithOpenAICLIPath(p string) OpenAIOption     { return func(a *OpenAIAgent) { a.cliPath = p } }
+func WithOpenAIAutoApprove(v bool) OpenAIOption   { return func(a *OpenAIAgent) { a.autoApprove = v } }
+func WithOpenAISessionStore(s *session.Store) OpenAIOption {
+	return func(a *OpenAIAgent) { a.sessionStore = s }
+}
 
 // NewOpenAIAgent 创建 OpenAI 智能体
 func NewOpenAIAgent(id string, logger *slog.Logger, opts ...OpenAIOption) *OpenAIAgent {
@@ -33,15 +56,18 @@ func NewOpenAIAgent(id string, logger *slog.Logger, opts ...OpenAIOption) *OpenA
 		BaseAgent: BaseAgent{
 			AgentID:      id,
 			ProviderType: ProviderOpenAI,
-			ModelID:      "gpt-4.1",
+			ModelID:      "gpt-4o",
 			Caps: []Capability{
 				CapCodeGen, CapTestGen, CapQuickTask,
 			},
 			InboxCh:   make(chan *schema.Message, 50),
 			StatusVal: StatusIdle,
 		},
-		httpClient: &http.Client{Timeout: 5 * time.Minute},
-		logger:     logger,
+		cliPath:     "codex",
+		autoApprove: true,
+		httpClient:  &http.Client{Timeout: 5 * time.Minute},
+		procManager: process.NewManager(logger),
+		logger:      logger,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -51,12 +77,17 @@ func NewOpenAIAgent(id string, logger *slog.Logger, opts ...OpenAIOption) *OpenA
 
 func (a *OpenAIAgent) Start(_ context.Context) error {
 	a.StatusVal = StatusIdle
-	a.logger.Info("openai agent started", "id", a.AgentID, "model", a.ModelID)
+	a.logger.Info("openai agent started",
+		"id", a.AgentID,
+		"model", a.ModelID,
+		"mode", a.modeString(),
+	)
 	return nil
 }
 
 func (a *OpenAIAgent) Stop(_ context.Context) error {
 	a.StatusVal = StatusStopped
+	a.procManager.StopAll()
 	a.logger.Info("openai agent stopped", "id", a.AgentID)
 	return nil
 }
@@ -66,7 +97,37 @@ func (a *OpenAIAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result
 	defer func() { a.StatusVal = StatusIdle }()
 
 	start := time.Now()
+	switch a.mode {
+	case OpenAIModeAPI:
+		return a.executeAPI(ctx, t, start)
+	case OpenAIModeCLI:
+		return a.executeCLI(ctx, t, start)
+	default:
+		return nil, fmt.Errorf("unknown openai mode: %d", a.mode)
+	}
+}
 
+func (a *OpenAIAgent) Stream(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
+	if a.mode == OpenAIModeCLI {
+		return a.streamCLI(ctx, t)
+	}
+
+	ch := make(chan schema.StreamEvent, 100)
+	go func() {
+		defer close(ch)
+		result, err := a.Execute(ctx, t)
+		if err != nil {
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
+			return
+		}
+		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: result.Content}
+		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "done"}
+	}()
+	return ch, nil
+}
+
+// executeAPI 通过 OpenAI Chat Completions API 执行
+func (a *OpenAIAgent) executeAPI(ctx context.Context, t *task.Task, start time.Time) (*schema.Result, error) {
 	reqBody := map[string]any{
 		"model": a.ModelID,
 		"messages": []map[string]string{
@@ -122,19 +183,110 @@ func (a *OpenAIAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result
 	}, nil
 }
 
-func (a *OpenAIAgent) Stream(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
-	ch := make(chan schema.StreamEvent, 100)
+// executeCLI 通过 codex/opencode CLI 子进程执行
+func (a *OpenAIAgent) executeCLI(ctx context.Context, t *task.Task, start time.Time) (*schema.Result, error) {
+	args := a.buildCLIArgs(t)
+
+	a.logger.Debug("executing openai cli",
+		"binary", a.cliPath,
+		"args", strings.Join(args, " "),
+		"work_dir", t.WorkDir,
+	)
+
+	cmd := exec.CommandContext(ctx, a.cliPath, args...)
+	if t.WorkDir != "" {
+		cmd.Dir = t.WorkDir
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("%s cli (exit %d): %s", a.cliPath, exitErr.ExitCode(), string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("%s cli: %w", a.cliPath, err)
+	}
+
+	// 尝试 JSON 解析
+	chunk, parseErr := process.ParseSingleJSON(output)
+	if parseErr != nil {
+		return &schema.Result{
+			AgentID:  a.AgentID,
+			Provider: string(ProviderOpenAI),
+			Content:  string(output),
+			Duration: time.Since(start),
+		}, nil
+	}
+
+	tokensIn, tokensOut := 0, 0
+	if chunk.Usage != nil {
+		tokensIn = chunk.Usage.InputTokens
+		tokensOut = chunk.Usage.OutputTokens
+	}
+
+	return &schema.Result{
+		AgentID:   a.AgentID,
+		Provider:  string(ProviderOpenAI),
+		Content:   chunk.Content,
+		TokensIn:  tokensIn,
+		TokensOut: tokensOut,
+		Duration:  time.Since(start),
+	}, nil
+}
+
+// streamCLI codex/opencode CLI 流式输出
+func (a *OpenAIAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
+	args := a.buildCLIArgs(t)
+
+	ch := make(chan schema.StreamEvent, 256)
+
 	go func() {
 		defer close(ch)
-		result, err := a.Execute(ctx, t)
+
+		cmd := exec.CommandContext(ctx, a.cliPath, args...)
+		if t.WorkDir != "" {
+			cmd.Dir = t.WorkDir
+		}
+
+		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
 			return
 		}
-		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: result.Content}
+
+		if err := cmd.Start(); err != nil {
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
+			return
+		}
+
+		parser := process.NewStreamParser(stdout, process.FormatPlainText)
+		for chunk := range parser.Parse(ctx) {
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
+		}
+
+		_ = cmd.Wait()
 		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "done"}
 	}()
+
 	return ch, nil
+}
+
+// buildCLIArgs 构建 codex CLI 参数
+func (a *OpenAIAgent) buildCLIArgs(t *task.Task) []string {
+	// codex CLI: codex -p "prompt" --approval-mode full-auto
+	args := []string{"-p", t.Prompt}
+
+	if a.autoApprove {
+		args = append(args, "--approval-mode", "full-auto")
+	}
+
+	return args
+}
+
+func (a *OpenAIAgent) modeString() string {
+	if a.mode == OpenAIModeCLI {
+		return "cli"
+	}
+	return "api"
 }
 
 type openaiResponse struct {

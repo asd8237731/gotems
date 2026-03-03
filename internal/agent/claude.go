@@ -9,8 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/lyymini/gotems/internal/process"
+	"github.com/lyymini/gotems/internal/session"
 	"github.com/lyymini/gotems/internal/task"
 	"github.com/lyymini/gotems/pkg/schema"
 )
@@ -20,26 +23,38 @@ type ClaudeMode int
 
 const (
 	ClaudeModeAPI ClaudeMode = iota // 通过 Anthropic API 调用
-	ClaudeModeCLI                   // 通过 claude -p CLI 调用
+	ClaudeModeCLI                   // 通过 claude CLI 子进程调用
 )
 
-// ClaudeAgent 是 Claude 的适配器
+// ClaudeAgent 是 Claude 的适配器，支持 API 和 CLI 双模式
+// CLI 模式支持：--session-id 多轮会话、-y 自动审批、流式输出解析
 type ClaudeAgent struct {
 	BaseAgent
-	apiKey     string
-	mode       ClaudeMode
-	cliPath    string
-	httpClient *http.Client
-	logger     *slog.Logger
+	apiKey       string
+	mode         ClaudeMode
+	cliPath      string
+	autoApprove  bool   // -y 自动审批工具调用
+	maxTurns     int    // --max-turns 最大轮数
+	systemPrompt string // --system-prompt 系统提示
+	httpClient   *http.Client
+	sessionStore *session.Store
+	procManager  *process.Manager
+	logger       *slog.Logger
 }
 
 // ClaudeOption 配置选项
 type ClaudeOption func(*ClaudeAgent)
 
-func WithClaudeAPIKey(key string) ClaudeOption  { return func(a *ClaudeAgent) { a.apiKey = key } }
-func WithClaudeMode(m ClaudeMode) ClaudeOption   { return func(a *ClaudeAgent) { a.mode = m } }
-func WithClaudeCLIPath(p string) ClaudeOption    { return func(a *ClaudeAgent) { a.cliPath = p } }
-func WithClaudeModel(m string) ClaudeOption      { return func(a *ClaudeAgent) { a.ModelID = m } }
+func WithClaudeAPIKey(key string) ClaudeOption     { return func(a *ClaudeAgent) { a.apiKey = key } }
+func WithClaudeMode(m ClaudeMode) ClaudeOption      { return func(a *ClaudeAgent) { a.mode = m } }
+func WithClaudeCLIPath(p string) ClaudeOption       { return func(a *ClaudeAgent) { a.cliPath = p } }
+func WithClaudeModel(m string) ClaudeOption         { return func(a *ClaudeAgent) { a.ModelID = m } }
+func WithClaudeAutoApprove(v bool) ClaudeOption     { return func(a *ClaudeAgent) { a.autoApprove = v } }
+func WithClaudeMaxTurns(n int) ClaudeOption         { return func(a *ClaudeAgent) { a.maxTurns = n } }
+func WithClaudeSystemPrompt(s string) ClaudeOption  { return func(a *ClaudeAgent) { a.systemPrompt = s } }
+func WithClaudeSessionStore(s *session.Store) ClaudeOption {
+	return func(a *ClaudeAgent) { a.sessionStore = s }
+}
 
 // NewClaudeAgent 创建 Claude 智能体
 func NewClaudeAgent(id string, logger *slog.Logger, opts ...ClaudeOption) *ClaudeAgent {
@@ -54,9 +69,12 @@ func NewClaudeAgent(id string, logger *slog.Logger, opts ...ClaudeOption) *Claud
 			InboxCh:   make(chan *schema.Message, 50),
 			StatusVal: StatusIdle,
 		},
-		cliPath:    "claude",
-		httpClient: &http.Client{Timeout: 5 * time.Minute},
-		logger:     logger,
+		cliPath:     "claude",
+		autoApprove: true, // 默认自动审批，编排器场景无人交互
+		maxTurns:    10,
+		httpClient:  &http.Client{Timeout: 5 * time.Minute},
+		procManager: process.NewManager(logger),
+		logger:      logger,
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -66,12 +84,18 @@ func NewClaudeAgent(id string, logger *slog.Logger, opts ...ClaudeOption) *Claud
 
 func (a *ClaudeAgent) Start(_ context.Context) error {
 	a.StatusVal = StatusIdle
-	a.logger.Info("claude agent started", "id", a.AgentID, "model", a.ModelID, "mode", a.modeString())
+	a.logger.Info("claude agent started",
+		"id", a.AgentID,
+		"model", a.ModelID,
+		"mode", a.modeString(),
+		"auto_approve", a.autoApprove,
+	)
 	return nil
 }
 
 func (a *ClaudeAgent) Stop(_ context.Context) error {
 	a.StatusVal = StatusStopped
+	a.procManager.StopAll()
 	a.logger.Info("claude agent stopped", "id", a.AgentID)
 	return nil
 }
@@ -92,6 +116,11 @@ func (a *ClaudeAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result
 }
 
 func (a *ClaudeAgent) Stream(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
+	if a.mode == ClaudeModeCLI {
+		return a.streamCLI(ctx, t)
+	}
+
+	// API 模式 fallback：执行后一次性返回
 	ch := make(chan schema.StreamEvent, 100)
 	go func() {
 		defer close(ch)
@@ -165,9 +194,15 @@ func (a *ClaudeAgent) executeAPI(ctx context.Context, t *task.Task, start time.T
 	}, nil
 }
 
-// executeCLI 通过 claude -p 命令行执行
+// executeCLI 通过 claude CLI 子进程执行（完整会话支持）
 func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.Time) (*schema.Result, error) {
-	args := []string{"-p", t.Prompt, "--output-format", "json"}
+	args := a.buildCLIArgs(t)
+
+	a.logger.Debug("executing claude cli",
+		"args", strings.Join(args, " "),
+		"work_dir", t.WorkDir,
+	)
+
 	cmd := exec.CommandContext(ctx, a.cliPath, args...)
 	if t.WorkDir != "" {
 		cmd.Dir = t.WorkDir
@@ -175,12 +210,17 @@ func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 
 	output, err := cmd.Output()
 	if err != nil {
+		// 获取 stderr 输出用于诊断
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("claude cli (exit %d): %s", exitErr.ExitCode(), string(exitErr.Stderr))
+		}
 		return nil, fmt.Errorf("claude cli: %w", err)
 	}
 
-	var cliResp cliResponse
-	if err := json.Unmarshal(output, &cliResp); err != nil {
-		// 非 JSON 输出，直接作为文本
+	// 解析 JSON 输出
+	chunk, parseErr := process.ParseSingleJSON(output)
+	if parseErr != nil {
+		// 非 JSON 输出，直接作为文本返回
 		return &schema.Result{
 			AgentID:  a.AgentID,
 			Provider: string(ProviderClaude),
@@ -189,14 +229,133 @@ func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 		}, nil
 	}
 
+	// 更新 session ID
+	if chunk.SessionID != "" && a.sessionStore != nil {
+		workDir := t.WorkDir
+		if workDir == "" {
+			workDir = "."
+		}
+		a.sessionStore.UpdateSessionID(a.AgentID, workDir, chunk.SessionID)
+	}
+
+	tokensIn, tokensOut := 0, 0
+	if chunk.Usage != nil {
+		tokensIn = chunk.Usage.InputTokens
+		tokensOut = chunk.Usage.OutputTokens
+	}
+
 	return &schema.Result{
 		AgentID:   a.AgentID,
 		Provider:  string(ProviderClaude),
-		Content:   cliResp.Result,
-		TokensIn:  cliResp.Usage.InputTokens,
-		TokensOut: cliResp.Usage.OutputTokens,
+		Content:   chunk.Content,
+		TokensIn:  tokensIn,
+		TokensOut: tokensOut,
 		Duration:  time.Since(start),
 	}, nil
+}
+
+// streamCLI CLI 模式的流式输出
+func (a *ClaudeAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
+	args := a.buildCLIArgs(t)
+	// 流式模式使用 stream-json 格式
+	for i, arg := range args {
+		if arg == "json" && i > 0 && args[i-1] == "--output-format" {
+			args[i] = "stream-json"
+		}
+	}
+
+	ch := make(chan schema.StreamEvent, 256)
+
+	go func() {
+		defer close(ch)
+
+		cmd := exec.CommandContext(ctx, a.cliPath, args...)
+		if t.WorkDir != "" {
+			cmd.Dir = t.WorkDir
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
+			return
+		}
+
+		// 用流解析器处理输出
+		parser := process.NewStreamParser(stdout, process.FormatJSONLines)
+		for chunk := range parser.Parse(ctx) {
+			switch chunk.Type {
+			case "text":
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
+			case "tool_use":
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "tool_use", Content: chunk.ToolName}
+			case "thinking":
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "thinking", Content: chunk.Content}
+			case "result":
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
+				// 更新 session ID
+				if chunk.SessionID != "" && a.sessionStore != nil {
+					workDir := t.WorkDir
+					if workDir == "" {
+						workDir = "."
+					}
+					a.sessionStore.UpdateSessionID(a.AgentID, workDir, chunk.SessionID)
+				}
+			case "error":
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: chunk.Content}
+			}
+		}
+
+		_ = cmd.Wait()
+		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "done"}
+	}()
+
+	return ch, nil
+}
+
+// buildCLIArgs 构建 CLI 命令参数
+func (a *ClaudeAgent) buildCLIArgs(t *task.Task) []string {
+	args := []string{
+		"-p", t.Prompt,
+		"--output-format", "json",
+	}
+
+	// 自动审批
+	if a.autoApprove {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+
+	// 最大轮数
+	if a.maxTurns > 0 {
+		args = append(args, "--max-turns", fmt.Sprintf("%d", a.maxTurns))
+	}
+
+	// 指定模型
+	if a.ModelID != "" {
+		args = append(args, "--model", a.ModelID)
+	}
+
+	// 系统提示
+	if a.systemPrompt != "" {
+		args = append(args, "--system-prompt", a.systemPrompt)
+	}
+
+	// 多轮会话：复用 session ID
+	if a.sessionStore != nil {
+		workDir := t.WorkDir
+		if workDir == "" {
+			workDir = "."
+		}
+		if sess := a.sessionStore.Get(a.AgentID, workDir); sess != nil && sess.SessionID != "" {
+			args = append(args, "--session-id", sess.SessionID)
+		}
+	}
+
+	return args
 }
 
 func (a *ClaudeAgent) modeString() string {
@@ -213,15 +372,6 @@ type anthropicResponse struct {
 		Text string `json:"text"`
 	} `json:"content"`
 	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-}
-
-// Claude CLI JSON 响应结构
-type cliResponse struct {
-	Result string `json:"result"`
-	Usage  struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`

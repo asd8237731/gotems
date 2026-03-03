@@ -158,7 +158,7 @@ func (c *Config) loadEnvProviders() {
 		c.Providers.OpenAI = &ProviderConfig{
 			APIKey: key,
 			Models: []ModelConfig{
-				{ID: "gpt-4.1", Role: "worker", Strengths: []string{"code_generation", "test_generation"}},
+				{ID: "gpt-4o", Role: "worker", Strengths: []string{"code_generation", "test_generation"}},
 			},
 		}
 	}
