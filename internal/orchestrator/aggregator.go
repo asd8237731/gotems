@@ -137,27 +137,39 @@ func ParallelExecute(ctx context.Context, agents []agent.Agent, t *task.Task) ([
 }
 
 // GuardedParallelExecute 带守卫的并行执行（竞赛模式，统一限流/熔断/成本追踪）
+// 竞赛模式下各 Agent 互相独立，一个失败不影响其余
 func GuardedParallelExecute(ctx context.Context, guard *Guard, agents []agent.Agent, t *task.Task) ([]*schema.Result, error) {
-	g, gCtx := errgroup.WithContext(ctx)
-	resultCh := make(chan *schema.Result, len(agents))
+	type agentResult struct {
+		result *schema.Result
+		err    error
+	}
+	resultCh := make(chan agentResult, len(agents))
 
 	for _, a := range agents {
-		g.Go(func() error {
-			result, err := guard.Execute(gCtx, a, t)
-			if err != nil {
-				return err
-			}
-			resultCh <- result
-			return nil
-		})
+		go func() {
+			result, err := guard.Execute(ctx, a, t)
+			resultCh <- agentResult{result: result, err: err}
+		}()
 	}
-
-	err := g.Wait()
-	close(resultCh)
 
 	var results []*schema.Result
-	for r := range resultCh {
-		results = append(results, r)
+	var errs []error
+	for range agents {
+		ar := <-resultCh
+		if ar.err != nil {
+			errs = append(errs, ar.err)
+		} else {
+			results = append(results, ar.result)
+		}
 	}
-	return results, err
+
+	var finalErr error
+	if len(errs) > 0 {
+		msgs := make([]string, len(errs))
+		for i, e := range errs {
+			msgs[i] = e.Error()
+		}
+		finalErr = fmt.Errorf("partial failures: %s", strings.Join(msgs, "; "))
+	}
+	return results, finalErr
 }

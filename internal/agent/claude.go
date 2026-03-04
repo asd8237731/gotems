@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -195,6 +194,7 @@ func (a *ClaudeAgent) executeAPI(ctx context.Context, t *task.Task, start time.T
 }
 
 // executeCLI 通过 claude CLI 子进程执行（完整会话支持）
+// 使用 Process Manager 统一管理子进程生命周期
 func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.Time) (*schema.Result, error) {
 	args := a.buildCLIArgs(t)
 
@@ -203,28 +203,40 @@ func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 		"work_dir", t.WorkDir,
 	)
 
-	cmd := exec.CommandContext(ctx, a.cliPath, args...)
-	if t.WorkDir != "" {
-		cmd.Dir = t.WorkDir
+	procID := fmt.Sprintf("%s-%s-%d", a.AgentID, t.ID, time.Now().UnixNano())
+	proc := a.procManager.Create(procID, process.Config{
+		Binary:  a.cliPath,
+		Args:    args,
+		WorkDir: t.WorkDir,
+	})
+	defer a.procManager.Remove(procID)
+
+	if err := proc.Start(ctx); err != nil {
+		return nil, fmt.Errorf("claude cli start: %w", err)
 	}
 
-	output, err := cmd.Output()
-	if err != nil {
-		// 获取 stderr 输出用于诊断
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("claude cli (exit %d): %s", exitErr.ExitCode(), string(exitErr.Stderr))
+	stdoutStr, stderrStr, err := proc.CollectOutput(ctx)
+	waitErr := proc.Wait()
+
+	if waitErr != nil {
+		errMsg := stderrStr
+		if errMsg == "" {
+			errMsg = waitErr.Error()
 		}
-		return nil, fmt.Errorf("claude cli: %w", err)
+		return nil, fmt.Errorf("claude cli: %s", errMsg)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claude cli read output: %w", err)
 	}
 
 	// 解析 JSON 输出
-	chunk, parseErr := process.ParseSingleJSON(output)
+	chunk, parseErr := process.ParseSingleJSON([]byte(stdoutStr))
 	if parseErr != nil {
 		// 非 JSON 输出，直接作为文本返回
 		return &schema.Result{
 			AgentID:  a.AgentID,
 			Provider: string(ProviderClaude),
-			Content:  string(output),
+			Content:  stdoutStr,
 			Duration: time.Since(start),
 		}, nil
 	}
@@ -255,6 +267,7 @@ func (a *ClaudeAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 }
 
 // streamCLI CLI 模式的流式输出
+// 使用 Process Manager 统一管理子进程生命周期
 func (a *ClaudeAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
 	args := a.buildCLIArgs(t)
 	// 流式模式使用 stream-json 格式
@@ -264,30 +277,36 @@ func (a *ClaudeAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schem
 		}
 	}
 
+	procID := fmt.Sprintf("%s-%s-stream-%d", a.AgentID, t.ID, time.Now().UnixNano())
+	proc := a.procManager.Create(procID, process.Config{
+		Binary:  a.cliPath,
+		Args:    args,
+		WorkDir: t.WorkDir,
+	})
+
+	if err := proc.Start(ctx); err != nil {
+		a.procManager.Remove(procID)
+		return nil, fmt.Errorf("claude cli stream start: %w", err)
+	}
+
 	ch := make(chan schema.StreamEvent, 256)
 
 	go func() {
 		defer close(ch)
+		defer a.procManager.Remove(procID)
 
-		cmd := exec.CommandContext(ctx, a.cliPath, args...)
-		if t.WorkDir != "" {
-			cmd.Dir = t.WorkDir
-		}
+		// 通过 Process 的 StreamOutput 获取输出流
+		for line := range proc.StreamOutput(ctx) {
+			if line.Stream == "stderr" {
+				continue
+			}
+			// 尝试解析为 JSON 流事件
+			var chunk process.StreamChunk
+			if err := json.Unmarshal([]byte(line.Content), &chunk); err != nil {
+				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: line.Content}
+				continue
+			}
 
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
-			return
-		}
-
-		if err := cmd.Start(); err != nil {
-			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
-			return
-		}
-
-		// 用流解析器处理输出
-		parser := process.NewStreamParser(stdout, process.FormatJSONLines)
-		for chunk := range parser.Parse(ctx) {
 			switch chunk.Type {
 			case "text":
 				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
@@ -297,7 +316,6 @@ func (a *ClaudeAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schem
 				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "thinking", Content: chunk.Content}
 			case "result":
 				ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
-				// 更新 session ID
 				if chunk.SessionID != "" && a.sessionStore != nil {
 					workDir := t.WorkDir
 					if workDir == "" {
@@ -310,7 +328,7 @@ func (a *ClaudeAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schem
 			}
 		}
 
-		_ = cmd.Wait()
+		_ = proc.Wait()
 		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "done"}
 	}()
 

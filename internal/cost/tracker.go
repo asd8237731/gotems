@@ -1,8 +1,12 @@
 package cost
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -152,6 +156,68 @@ func (t *Tracker) TodayCost() float64 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.daily[time.Now().Format("2006-01-02")]
+}
+
+// FetchPricing 从远程 API 拉取最新定价并更新本地定价表
+// endpoint 应返回 JSON: {"models": {"model-id": {"input": 0.003, "output": 0.015}, ...}}
+func (t *Tracker) FetchPricing(ctx context.Context, endpoint string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create pricing request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch pricing: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("pricing api returned status %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Models map[string]struct {
+			Input  float64 `json:"input"`
+			Output float64 `json:"output"`
+		} `json:"models"`
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read pricing response: %w", err)
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("parse pricing: %w", err)
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	updated := 0
+	for model, p := range payload.Models {
+		t.pricing[model] = ModelPricing{
+			CostPerKInput:  p.Input,
+			CostPerKOutput: p.Output,
+		}
+		updated++
+	}
+
+	t.logger.Info("pricing updated from remote", "endpoint", endpoint, "models_updated", updated)
+	return nil
+}
+
+// Pricing 返回当前定价表的快照
+func (t *Tracker) Pricing() map[string]ModelPricing {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	result := make(map[string]ModelPricing, len(t.pricing))
+	for k, v := range t.pricing {
+		result[k] = v
+	}
+	return result
 }
 
 // Summarize 返回汇总统计

@@ -9,6 +9,7 @@ import (
 	"github.com/lyymini/gotems/internal/agent"
 	"github.com/lyymini/gotems/internal/comm"
 	"github.com/lyymini/gotems/internal/cost"
+	"github.com/lyymini/gotems/internal/observability"
 	"github.com/lyymini/gotems/internal/ratelimit"
 	"github.com/lyymini/gotems/internal/splitter"
 	"github.com/lyymini/gotems/internal/task"
@@ -22,6 +23,7 @@ type Orchestrator struct {
 	taskPool    *task.Pool
 	fileLock    *task.FileLock
 	mailbox     *comm.Mailbox
+	negotiator  *comm.Negotiator
 	router      *Router
 	dag         *DAGExecutor
 	aggregator  *Aggregator
@@ -31,6 +33,8 @@ type Orchestrator struct {
 	breaker     *ratelimit.Breaker
 	splitter    *splitter.Splitter
 	workspace   *workspace.Workspace // 可选，需 git 仓库
+	metrics     *observability.Metrics
+	tracer      *observability.Tracer
 	logger      *slog.Logger
 }
 
@@ -64,6 +68,8 @@ func New(cfg OrchestratorConfig, logger *slog.Logger) *Orchestrator {
 	costTracker := cost.NewTracker(cfg.CostLimits, logger)
 	guard := NewGuard(limiter, breaker, costTracker, logger)
 	mailbox := comm.NewMailbox(logger)
+	negotiator := comm.NewNegotiator(mailbox, logger)
+	metrics := observability.NewMetrics(logger)
 	dag := NewDAGExecutor(router, guard, mailbox, logger)
 
 	o := &Orchestrator{
@@ -71,6 +77,7 @@ func New(cfg OrchestratorConfig, logger *slog.Logger) *Orchestrator {
 		taskPool:    task.NewPool(),
 		fileLock:    task.NewFileLock(),
 		mailbox:     mailbox,
+		negotiator:  negotiator,
 		router:      router,
 		dag:         dag,
 		aggregator:  NewAggregator(cfg.JudgeAgent, logger),
@@ -79,8 +86,12 @@ func New(cfg OrchestratorConfig, logger *slog.Logger) *Orchestrator {
 		limiter:     limiter,
 		breaker:     breaker,
 		splitter:    splitter.NewSplitter(cfg.SplitterAgent, logger),
+		metrics:     metrics,
 		logger:      logger,
 	}
+
+	// Guard 注入 Metrics
+	guard.SetMetrics(metrics)
 
 	// 如果指定了工作目录，初始化 Workspace
 	if cfg.WorkDir != "" {
@@ -288,6 +299,22 @@ func (o *Orchestrator) Breaker() *ratelimit.Breaker {
 // Mailbox 返回邮箱系统
 func (o *Orchestrator) Mailbox() *comm.Mailbox {
 	return o.mailbox
+}
+
+// Negotiator 返回协商器
+func (o *Orchestrator) Negotiator() *comm.Negotiator {
+	return o.negotiator
+}
+
+// Metrics 返回指标收集器
+func (o *Orchestrator) Metrics() *observability.Metrics {
+	return o.metrics
+}
+
+// SetTracer 注入链路追踪器
+func (o *Orchestrator) SetTracer(t *observability.Tracer) {
+	o.tracer = t
+	o.guard.SetTracer(t)
 }
 
 // AgentsMap 返回 Agent 映射

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -196,6 +195,7 @@ func (a *GeminiAgent) executeAPI(ctx context.Context, t *task.Task, start time.T
 }
 
 // executeCLI 通过 gemini CLI 子进程执行
+// 使用 Process Manager 统一管理子进程生命周期
 func (a *GeminiAgent) executeCLI(ctx context.Context, t *task.Task, start time.Time) (*schema.Result, error) {
 	args := a.buildCLIArgs(t)
 
@@ -204,26 +204,39 @@ func (a *GeminiAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 		"work_dir", t.WorkDir,
 	)
 
-	cmd := exec.CommandContext(ctx, a.cliPath, args...)
-	if t.WorkDir != "" {
-		cmd.Dir = t.WorkDir
+	procID := fmt.Sprintf("%s-%s-%d", a.AgentID, t.ID, time.Now().UnixNano())
+	proc := a.procManager.Create(procID, process.Config{
+		Binary:  a.cliPath,
+		Args:    args,
+		WorkDir: t.WorkDir,
+	})
+	defer a.procManager.Remove(procID)
+
+	if err := proc.Start(ctx); err != nil {
+		return nil, fmt.Errorf("gemini cli start: %w", err)
 	}
 
-	output, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("gemini cli (exit %d): %s", exitErr.ExitCode(), string(exitErr.Stderr))
+	stdoutStr, stderrStr, err := proc.CollectOutput(ctx)
+	waitErr := proc.Wait()
+
+	if waitErr != nil {
+		errMsg := stderrStr
+		if errMsg == "" {
+			errMsg = waitErr.Error()
 		}
-		return nil, fmt.Errorf("gemini cli: %w", err)
+		return nil, fmt.Errorf("gemini cli: %s", errMsg)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gemini cli read output: %w", err)
 	}
 
 	// 尝试 JSON 解析
-	chunk, parseErr := process.ParseSingleJSON(output)
+	chunk, parseErr := process.ParseSingleJSON([]byte(stdoutStr))
 	if parseErr != nil {
 		return &schema.Result{
 			AgentID:  a.AgentID,
 			Provider: string(ProviderGemini),
-			Content:  string(output),
+			Content:  stdoutStr,
 			Duration: time.Since(start),
 		}, nil
 	}
@@ -245,36 +258,36 @@ func (a *GeminiAgent) executeCLI(ctx context.Context, t *task.Task, start time.T
 }
 
 // streamCLI Gemini CLI 流式输出
+// 使用 Process Manager 统一管理子进程生命周期
 func (a *GeminiAgent) streamCLI(ctx context.Context, t *task.Task) (<-chan schema.StreamEvent, error) {
 	args := a.buildCLIArgs(t)
+
+	procID := fmt.Sprintf("%s-%s-stream-%d", a.AgentID, t.ID, time.Now().UnixNano())
+	proc := a.procManager.Create(procID, process.Config{
+		Binary:  a.cliPath,
+		Args:    args,
+		WorkDir: t.WorkDir,
+	})
+
+	if err := proc.Start(ctx); err != nil {
+		a.procManager.Remove(procID)
+		return nil, fmt.Errorf("gemini cli stream start: %w", err)
+	}
 
 	ch := make(chan schema.StreamEvent, 256)
 
 	go func() {
 		defer close(ch)
+		defer a.procManager.Remove(procID)
 
-		cmd := exec.CommandContext(ctx, a.cliPath, args...)
-		if t.WorkDir != "" {
-			cmd.Dir = t.WorkDir
+		for line := range proc.StreamOutput(ctx) {
+			if line.Stream == "stderr" {
+				continue
+			}
+			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: line.Content}
 		}
 
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
-			return
-		}
-
-		if err := cmd.Start(); err != nil {
-			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "error", Content: err.Error()}
-			return
-		}
-
-		parser := process.NewStreamParser(stdout, process.FormatPlainText)
-		for chunk := range parser.Parse(ctx) {
-			ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "text", Content: chunk.Content}
-		}
-
-		_ = cmd.Wait()
+		_ = proc.Wait()
 		ch <- schema.StreamEvent{AgentID: a.AgentID, Type: "done"}
 	}()
 

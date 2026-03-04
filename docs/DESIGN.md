@@ -277,16 +277,17 @@ Agent 后续执行:
 ```
 cmd/gotems/main.go
   ├── internal/orchestrator  (编排引擎)
-  │     ├── Guard            (执行守卫：限流+熔断+成本)
+  │     ├── Guard            (执行守卫：限流+熔断+成本+Metrics+Tracer)
   │     ├── DAGExecutor      (DAG 执行：Guard+上下文传递+Mailbox广播)
-  │     ├── Aggregator       (结果聚合：GuardedParallelExecute)
-  │     ├── internal/agent   (Agent 适配器)
-  │     │     ├── internal/process   (子进程管理)
+  │     ├── Aggregator       (结果聚合：GuardedParallelExecute 容错模式)
+  │     ├── internal/agent   (Agent 适配器，CLI 通过 Process Manager 执行)
+  │     │     ├── internal/process   (子进程管理：Manager + Process 生命周期)
   │     │     └── internal/session   (会话持久化)
-  │     ├── internal/comm    (通信层：Mailbox)
+  │     ├── internal/comm    (通信层：Mailbox + Negotiator 协商协议)
   │     ├── internal/task    (任务管理)
-  │     ├── internal/cost    (成本追踪+定价表)
+  │     ├── internal/cost    (成本追踪+定价表+动态远程更新)
   │     ├── internal/ratelimit (限流/熔断)
+  │     ├── internal/observability (Metrics + Tracer：Prometheus + OpenTelemetry)
   │     ├── internal/workspace (git worktree 隔离)
   │     └── internal/splitter (任务拆分)
   ├── internal/mcp           (MCP 协议桥接)
@@ -351,13 +352,23 @@ cmd/gotems/main.go
 - [x] Result 增加 Model 字段：支持定价查表
 - [x] GuardedParallelExecute：竞赛模式并行执行也经过 Guard 守卫
 
-### Phase 7 — 生产打磨（规划中）
-- [ ] Agent 间基于 session 的多轮协商协议（Question/Answer）
-- [ ] Process Manager 接入 Agent CLI 执行路径
-- [ ] 端到端集成测试（真实 CLI 调用 mock）
-- [ ] OpenTelemetry 链路追踪接入
-- [ ] Prometheus 指标导出
-- [ ] 动态定价表更新（从远程 API 拉取最新价格）
+### Phase 7 — 生产打磨 (v0.5.0) ✅
+- [x] Agent 间基于 session 的多轮协商协议（Question/Answer）— `internal/comm/negotiator.go`
+- [x] Process Manager 接入 Agent CLI 执行路径 — claude/openai/gemini 均通过 `procManager.Create()` 统一管理
+- [x] 端到端集成测试（mock CLI 脚本验证完整执行路径）— `internal/agent/agent_integration_test.go` (7 tests)
+- [x] OpenTelemetry 链路追踪接入 — `internal/observability/observability.go` Tracer
+- [x] Prometheus 指标导出 — `internal/observability/observability.go` Metrics + PrometheusText()
+- [x] 动态定价表更新（从远程 API 拉取最新价格）— `cost.Tracker.FetchPricing()`
+- [x] Guard 集成 Metrics + Tracer：每次执行自动记录指标和链路追踪
+- [x] GuardedParallelExecute 容错改造：独立 goroutine 替代 errgroup，单 Agent 失败不影响其他
+- [x] 版本号更新至 v0.5.0
+
+### Phase 8 — 未来规划
+- [ ] Web UI 实时 Metrics 仪表盘（Prometheus + Grafana）
+- [ ] OTLP 远程 Trace 导出（替换 stdout exporter）
+- [ ] Agent 热重载（运行时动态增删 Agent）
+- [ ] 分布式多节点编排（跨机器 Agent 协作）
+- [ ] 自然语言任务拆分（LLM 驱动的 DAG 生成）
 
 ---
 
@@ -365,13 +376,15 @@ cmd/gotems/main.go
 
 | 模块 | 测试文件 | 测试用例数 |
 |------|---------|:---------:|
-| comm | `mailbox_test.go` | 3 |
-| cost | `tracker_test.go` | 3 |
+| agent | `agent_integration_test.go` | 7 |
+| comm | `mailbox_test.go`, `negotiator_test.go` | 7 |
+| cost | `tracker_test.go`, `pricing_test.go` | 10 |
 | mcp | `bridge_test.go`, `stdio_test.go` | 8 |
-| orchestrator | `router_test.go` | 3 |
+| observability | `observability_test.go` | 4 |
+| orchestrator | `router_test.go`, `guard_test.go`, `dag_test.go` | 12 |
 | process | `stream_test.go` | 7 |
 | ratelimit | `ratelimit_test.go` | 5 |
 | session | `session_test.go` | 8 |
 | splitter | `splitter_test.go` | 5 |
 | task | `task_test.go`, `filelock_test.go` | 8 |
-| **总计** | | **42** |
+| **总计** | | **81** |

@@ -1,14 +1,12 @@
 package cost
 
 import (
-	"log/slog"
 	"math"
-	"os"
 	"testing"
 )
 
 func TestTrackerTrackAndSummarize(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logger := testLogger()
 	tracker := NewTracker(Limits{DailyMax: 100.0}, logger)
 
 	err := tracker.Track(Record{
@@ -51,8 +49,7 @@ func TestTrackerTrackAndSummarize(t *testing.T) {
 }
 
 func TestTrackerDailyLimit(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := NewTracker(Limits{DailyMax: 0.10}, logger)
+	tracker := NewTracker(Limits{DailyMax: 0.10}, testLogger())
 
 	err := tracker.Track(Record{Cost: 0.08})
 	if err != nil {
@@ -66,8 +63,7 @@ func TestTrackerDailyLimit(t *testing.T) {
 }
 
 func TestTrackerTodayCost(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := NewTracker(Limits{}, logger)
+	tracker := NewTracker(Limits{}, testLogger())
 
 	tracker.Track(Record{Cost: 0.10})
 	tracker.Track(Record{Cost: 0.20})
