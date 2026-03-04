@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/lyymini/gotems/internal/agent"
+	"github.com/lyymini/gotems/internal/comm"
 	"github.com/lyymini/gotems/internal/task"
 	"github.com/lyymini/gotems/pkg/schema"
 	"golang.org/x/sync/errgroup"
@@ -19,22 +21,26 @@ type DAG struct {
 
 // DAGNode 是 DAG 中的一个节点
 type DAGNode struct {
-	Task     *task.Task
+	Task      *task.Task
 	DependsOn []string
-	Agent    agent.Agent // 路由分配的 Agent
+	Agent     agent.Agent // 路由分配的 Agent
 }
 
 // DAGExecutor 执行 DAG
 type DAGExecutor struct {
-	router *Router
-	logger *slog.Logger
+	router  *Router
+	guard   *Guard
+	mailbox *comm.Mailbox
+	logger  *slog.Logger
 }
 
 // NewDAGExecutor 创建 DAG 执行器
-func NewDAGExecutor(router *Router, logger *slog.Logger) *DAGExecutor {
+func NewDAGExecutor(router *Router, guard *Guard, mailbox *comm.Mailbox, logger *slog.Logger) *DAGExecutor {
 	return &DAGExecutor{
-		router: router,
-		logger: logger,
+		router:  router,
+		guard:   guard,
+		mailbox: mailbox,
+		logger:  logger,
 	}
 }
 
@@ -56,17 +62,6 @@ func (e *DAGExecutor) Build(tasks []*task.Task) (*DAG, error) {
 
 	// 拓扑排序（Kahn 算法）
 	inDegree := make(map[string]int)
-	for id := range dag.nodes {
-		inDegree[id] = 0
-	}
-	for _, node := range dag.nodes {
-		for _, dep := range node.DependsOn {
-			inDegree[node.Task.ID]++
-			_ = dep
-		}
-	}
-
-	// 重新计算入度
 	for id := range dag.nodes {
 		inDegree[id] = len(dag.nodes[id].DependsOn)
 	}
@@ -103,11 +98,18 @@ func (e *DAGExecutor) Build(tasks []*task.Task) (*DAG, error) {
 }
 
 // Execute 按拓扑序执行 DAG，同层任务用 errgroup 并行
+// 支持：Guard 中间件（限流/熔断/成本）+ 节点间上下文传递 + Mailbox 结果广播
 func (e *DAGExecutor) Execute(ctx context.Context, dag *DAG) (map[string]*schema.Result, error) {
 	results := make(map[string]*schema.Result)
 
 	for layerIdx, layer := range dag.order {
 		e.logger.Info("executing DAG layer", "layer", layerIdx, "tasks", len(layer))
+
+		// 在执行前，将前序结果注入到当前层任务的上下文中
+		for _, taskID := range layer {
+			node := dag.nodes[taskID]
+			e.injectDependencyContext(node, results)
+		}
 
 		g, gCtx := errgroup.WithContext(ctx)
 		resultCh := make(chan *layerResult, len(layer))
@@ -124,12 +126,19 @@ func (e *DAGExecutor) Execute(ctx context.Context, dag *DAG) (map[string]*schema
 					"agent", node.Agent.ID(),
 					"provider", node.Agent.Provider(),
 				)
-				result, err := node.Agent.Execute(gCtx, node.Task)
+
+				// 通过 Guard 执行（统一限流/熔断/成本追踪）
+				result, err := e.guard.Execute(gCtx, node.Agent, node.Task)
 				if err != nil {
 					resultCh <- &layerResult{taskID: node.Task.ID, err: err}
 					return fmt.Errorf("task %s failed: %w", node.Task.ID, err)
 				}
+
 				resultCh <- &layerResult{taskID: node.Task.ID, result: result}
+
+				// 通过 Mailbox 广播任务完成结果
+				e.broadcastResult(node, result)
+
 				return nil
 			})
 		}
@@ -151,6 +160,64 @@ func (e *DAGExecutor) Execute(ctx context.Context, dag *DAG) (map[string]*schema
 	return results, nil
 }
 
+// injectDependencyContext 将前序任务的结果摘要注入到当前任务的 Prompt 中
+func (e *DAGExecutor) injectDependencyContext(node *DAGNode, results map[string]*schema.Result) {
+	if len(node.DependsOn) == 0 {
+		return
+	}
+
+	var depContexts []string
+	for _, depID := range node.DependsOn {
+		if r, ok := results[depID]; ok && r.Content != "" {
+			depContexts = append(depContexts, fmt.Sprintf("[来自任务 %s 的结果]\n%s", depID, r.Content))
+		}
+	}
+
+	if len(depContexts) == 0 {
+		return
+	}
+
+	contextPrefix := "以下是前序任务的执行结果，请在此基础上继续完成当前任务：\n\n" +
+		strings.Join(depContexts, "\n\n---\n\n") +
+		"\n\n---\n\n当前任务：\n"
+
+	node.Task.Prompt = contextPrefix + node.Task.Prompt
+
+	// 同时写入 Metadata 方便追溯
+	if node.Task.Metadata == nil {
+		node.Task.Metadata = make(map[string]any)
+	}
+	depResults := make(map[string]string)
+	for _, depID := range node.DependsOn {
+		if r, ok := results[depID]; ok {
+			depResults[depID] = r.Content
+		}
+	}
+	node.Task.Metadata["dep_results"] = depResults
+}
+
+// broadcastResult 通过 Mailbox 广播任务完成消息
+func (e *DAGExecutor) broadcastResult(node *DAGNode, result *schema.Result) {
+	if e.mailbox == nil {
+		return
+	}
+	msg := &schema.Message{
+		ID:   fmt.Sprintf("dag-result-%s", node.Task.ID),
+		From: node.Agent.ID(),
+		To:   "*",
+		Type: schema.MsgTaskResult,
+		Content: fmt.Sprintf("任务 %s 已完成", node.Task.ID),
+		Metadata: map[string]any{
+			"task_id":  node.Task.ID,
+			"agent_id": node.Agent.ID(),
+			"summary":  truncate(result.Content, 200),
+		},
+	}
+	if err := e.mailbox.Broadcast(msg); err != nil {
+		e.logger.Debug("broadcast result skipped", "task_id", node.Task.ID, "error", err)
+	}
+}
+
 // Layers 返回分层列表（用于展示）
 func (d *DAG) Layers() [][]string {
 	return d.order
@@ -160,4 +227,13 @@ type layerResult struct {
 	taskID string
 	result *schema.Result
 	err    error
+}
+
+// truncate 截断字符串
+func truncate(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
 }

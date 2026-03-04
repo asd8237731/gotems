@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/lyymini/gotems/internal/task"
 	"github.com/lyymini/gotems/pkg/schema"
@@ -99,7 +100,11 @@ func (b *BaseAgent) Capabilities() []Capability { return b.Caps }
 func (b *BaseAgent) Inbox() <-chan *schema.Message { return b.InboxCh }
 func (b *BaseAgent) Status() Status           { return b.StatusVal }
 
-func (b *BaseAgent) Send(_ context.Context, msg *schema.Message) error {
-	b.InboxCh <- msg
-	return nil
+func (b *BaseAgent) Send(ctx context.Context, msg *schema.Message) error {
+	select {
+	case b.InboxCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("send to %s cancelled: %w", b.AgentID, ctx.Err())
+	}
 }

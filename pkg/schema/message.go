@@ -61,6 +61,7 @@ type StreamEvent struct {
 type Result struct {
 	AgentID    string         `json:"agent_id"`
 	Provider   string         `json:"provider"`
+	Model      string         `json:"model"`
 	Content    string         `json:"content"`
 	TokensIn   int            `json:"tokens_in"`
 	TokensOut  int            `json:"tokens_out"`

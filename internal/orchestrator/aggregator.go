@@ -110,7 +110,7 @@ func (a *Aggregator) judgeResults(ctx context.Context, prompt string, results []
 	return final, nil
 }
 
-// ParallelExecute 并行执行同一任务到多个 Agent（竞赛模式）
+// ParallelExecute 并行执行同一任务到多个 Agent（竞赛模式，无守卫）
 func ParallelExecute(ctx context.Context, agents []agent.Agent, t *task.Task) ([]*schema.Result, error) {
 	g, gCtx := errgroup.WithContext(ctx)
 	resultCh := make(chan *schema.Result, len(agents))
@@ -118,6 +118,32 @@ func ParallelExecute(ctx context.Context, agents []agent.Agent, t *task.Task) ([
 	for _, a := range agents {
 		g.Go(func() error {
 			result, err := a.Execute(gCtx, t)
+			if err != nil {
+				return err
+			}
+			resultCh <- result
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	close(resultCh)
+
+	var results []*schema.Result
+	for r := range resultCh {
+		results = append(results, r)
+	}
+	return results, err
+}
+
+// GuardedParallelExecute 带守卫的并行执行（竞赛模式，统一限流/熔断/成本追踪）
+func GuardedParallelExecute(ctx context.Context, guard *Guard, agents []agent.Agent, t *task.Task) ([]*schema.Result, error) {
+	g, gCtx := errgroup.WithContext(ctx)
+	resultCh := make(chan *schema.Result, len(agents))
+
+	for _, a := range agents {
+		g.Go(func() error {
+			result, err := guard.Execute(gCtx, a, t)
 			if err != nil {
 				return err
 			}

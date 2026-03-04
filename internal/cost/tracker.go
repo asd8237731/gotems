@@ -7,11 +7,35 @@ import (
 	"time"
 )
 
+// ModelPricing 模型定价（每 1K tokens）
+type ModelPricing struct {
+	CostPerKInput  float64
+	CostPerKOutput float64
+}
+
+// 内置定价表（可通过 RegisterPricing 覆盖）
+var defaultPricing = map[string]ModelPricing{
+	// Claude
+	"claude-sonnet-4-6":  {CostPerKInput: 0.003, CostPerKOutput: 0.015},
+	"claude-haiku-4-5":   {CostPerKInput: 0.0008, CostPerKOutput: 0.004},
+	"claude-opus-4-6":    {CostPerKInput: 0.015, CostPerKOutput: 0.075},
+	// Gemini
+	"gemini-2.5-pro":     {CostPerKInput: 0.00125, CostPerKOutput: 0.005},
+	"gemini-2.5-flash":   {CostPerKInput: 0.00015, CostPerKOutput: 0.0006},
+	// OpenAI
+	"gpt-4o":             {CostPerKInput: 0.002, CostPerKOutput: 0.008},
+	"gpt-4o-mini":        {CostPerKInput: 0.00015, CostPerKOutput: 0.0006},
+	"o3":                 {CostPerKInput: 0.01, CostPerKOutput: 0.04},
+	// Ollama（本地免费）
+	"qwen3:32b":          {CostPerKInput: 0, CostPerKOutput: 0},
+}
+
 // Tracker 追踪各 Agent 和模型的 Token 消耗与费用
 type Tracker struct {
 	mu      sync.RWMutex
 	records []Record
 	daily   map[string]float64 // date -> cost
+	pricing map[string]ModelPricing
 	limits  Limits
 	logger  *slog.Logger
 }
@@ -45,19 +69,50 @@ type Summary struct {
 
 // NewTracker 创建费用追踪器
 func NewTracker(limits Limits, logger *slog.Logger) *Tracker {
+	// 复制默认定价表
+	pricing := make(map[string]ModelPricing, len(defaultPricing))
+	for k, v := range defaultPricing {
+		pricing[k] = v
+	}
 	return &Tracker{
-		daily:  make(map[string]float64),
-		limits: limits,
-		logger: logger,
+		daily:   make(map[string]float64),
+		pricing: pricing,
+		limits:  limits,
+		logger:  logger,
 	}
 }
 
-// Track 记录一次消耗
+// RegisterPricing 注册或覆盖模型定价
+func (t *Tracker) RegisterPricing(model string, p ModelPricing) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pricing[model] = p
+}
+
+// CalcCost 根据模型和 token 数自动计算费用
+func (t *Tracker) CalcCost(model string, tokensIn, tokensOut int) float64 {
+	t.mu.RLock()
+	p, ok := t.pricing[model]
+	t.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return float64(tokensIn)/1000*p.CostPerKInput + float64(tokensOut)/1000*p.CostPerKOutput
+}
+
+// Track 记录一次消耗（Cost 为 0 时自动从定价表计算）
 func (t *Tracker) Track(r Record) error {
 	r.Timestamp = time.Now()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// 自动计算费用
+	if r.Cost == 0 && r.Model != "" {
+		if p, ok := t.pricing[r.Model]; ok {
+			r.Cost = float64(r.TokensIn)/1000*p.CostPerKInput + float64(r.TokensOut)/1000*p.CostPerKOutput
+		}
+	}
 
 	// 检查每日限额
 	dateKey := r.Timestamp.Format("2006-01-02")
