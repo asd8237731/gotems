@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,47 +143,48 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 // PrometheusText 返回 Prometheus exposition 格式文本
 func (m *Metrics) PrometheusText() string {
 	snap := m.Snapshot()
-	var b []byte
+	var b strings.Builder
+	b.Grow(2048) // 预分配容量
 
-	b = append(b, fmt.Sprintf("# HELP gotems_tasks_total Total number of tasks executed\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_tasks_total counter\n")...)
-	b = append(b, fmt.Sprintf("gotems_tasks_total %d\n", snap.TasksTotal)...)
+	b.WriteString("# HELP gotems_tasks_total Total number of tasks executed\n")
+	b.WriteString("# TYPE gotems_tasks_total counter\n")
+	fmt.Fprintf(&b, "gotems_tasks_total %d\n", snap.TasksTotal)
 
-	b = append(b, fmt.Sprintf("# HELP gotems_tasks_succeeded_total Successful tasks\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_tasks_succeeded_total counter\n")...)
-	b = append(b, fmt.Sprintf("gotems_tasks_succeeded_total %d\n", snap.TasksSucceeded)...)
+	b.WriteString("# HELP gotems_tasks_succeeded_total Successful tasks\n")
+	b.WriteString("# TYPE gotems_tasks_succeeded_total counter\n")
+	fmt.Fprintf(&b, "gotems_tasks_succeeded_total %d\n", snap.TasksSucceeded)
 
-	b = append(b, fmt.Sprintf("# HELP gotems_tasks_failed_total Failed tasks\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_tasks_failed_total counter\n")...)
-	b = append(b, fmt.Sprintf("gotems_tasks_failed_total %d\n", snap.TasksFailed)...)
+	b.WriteString("# HELP gotems_tasks_failed_total Failed tasks\n")
+	b.WriteString("# TYPE gotems_tasks_failed_total counter\n")
+	fmt.Fprintf(&b, "gotems_tasks_failed_total %d\n", snap.TasksFailed)
 
-	b = append(b, fmt.Sprintf("# HELP gotems_tokens_in_total Total input tokens\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_tokens_in_total counter\n")...)
-	b = append(b, fmt.Sprintf("gotems_tokens_in_total %d\n", snap.TokensIn)...)
+	b.WriteString("# HELP gotems_tokens_in_total Total input tokens\n")
+	b.WriteString("# TYPE gotems_tokens_in_total counter\n")
+	fmt.Fprintf(&b, "gotems_tokens_in_total %d\n", snap.TokensIn)
 
-	b = append(b, fmt.Sprintf("# HELP gotems_tokens_out_total Total output tokens\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_tokens_out_total counter\n")...)
-	b = append(b, fmt.Sprintf("gotems_tokens_out_total %d\n", snap.TokensOut)...)
+	b.WriteString("# HELP gotems_tokens_out_total Total output tokens\n")
+	b.WriteString("# TYPE gotems_tokens_out_total counter\n")
+	fmt.Fprintf(&b, "gotems_tokens_out_total %d\n", snap.TokensOut)
 
-	b = append(b, fmt.Sprintf("# HELP gotems_provider_requests_total Requests per provider\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_provider_requests_total counter\n")...)
+	b.WriteString("# HELP gotems_provider_requests_total Requests per provider\n")
+	b.WriteString("# TYPE gotems_provider_requests_total counter\n")
 	for provider, ps := range snap.ByProvider {
-		b = append(b, fmt.Sprintf("gotems_provider_requests_total{provider=%q} %d\n", provider, ps.Requests)...)
+		fmt.Fprintf(&b, "gotems_provider_requests_total{provider=%q} %d\n", provider, ps.Requests)
 	}
 
-	b = append(b, fmt.Sprintf("# HELP gotems_provider_failures_total Failures per provider\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_provider_failures_total counter\n")...)
+	b.WriteString("# HELP gotems_provider_failures_total Failures per provider\n")
+	b.WriteString("# TYPE gotems_provider_failures_total counter\n")
 	for provider, ps := range snap.ByProvider {
-		b = append(b, fmt.Sprintf("gotems_provider_failures_total{provider=%q} %d\n", provider, ps.Failures)...)
+		fmt.Fprintf(&b, "gotems_provider_failures_total{provider=%q} %d\n", provider, ps.Failures)
 	}
 
-	b = append(b, fmt.Sprintf("# HELP gotems_provider_avg_latency_ms Average latency per provider\n")...)
-	b = append(b, fmt.Sprintf("# TYPE gotems_provider_avg_latency_ms gauge\n")...)
+	b.WriteString("# HELP gotems_provider_avg_latency_ms Average latency per provider\n")
+	b.WriteString("# TYPE gotems_provider_avg_latency_ms gauge\n")
 	for provider, ps := range snap.ByProvider {
-		b = append(b, fmt.Sprintf("gotems_provider_avg_latency_ms{provider=%q} %.2f\n", provider, ps.AvgLatencyMs)...)
+		fmt.Fprintf(&b, "gotems_provider_avg_latency_ms{provider=%q} %.2f\n", provider, ps.AvgLatencyMs)
 	}
 
-	return string(b)
+	return b.String()
 }
 
 // --- OpenTelemetry 链路追踪 ---

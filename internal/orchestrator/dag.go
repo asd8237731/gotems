@@ -44,13 +44,14 @@ func NewDAGExecutor(router *Router, guard *Guard, mailbox *comm.Mailbox, logger 
 	}
 }
 
-// Build 从任务列表构建 DAG 并做拓扑排序
+// Build 从任务列表构建 DAG 并做拓扑排序（优化为 O(V+E)）
 func (e *DAGExecutor) Build(tasks []*task.Task) (*DAG, error) {
 	dag := &DAG{
 		nodes: make(map[string]*DAGNode),
 	}
 
-	// 构建节点
+	// 构建节点和邻接表
+	adjList := make(map[string][]string) // 反向邻接表：被依赖者 -> 依赖者列表
 	for _, t := range tasks {
 		a := e.router.Route(t.Tags)
 		dag.nodes[t.ID] = &DAGNode{
@@ -58,39 +59,47 @@ func (e *DAGExecutor) Build(tasks []*task.Task) (*DAG, error) {
 			DependsOn: t.DependsOn,
 			Agent:     a,
 		}
+		for _, dep := range t.DependsOn {
+			adjList[dep] = append(adjList[dep], t.ID)
+		}
 	}
 
-	// 拓扑排序（Kahn 算法）
+	// 拓扑排序（Kahn 算法优化版）
 	inDegree := make(map[string]int)
-	for id := range dag.nodes {
-		inDegree[id] = len(dag.nodes[id].DependsOn)
+	for id, node := range dag.nodes {
+		inDegree[id] = len(node.DependsOn)
 	}
 
 	var layers [][]string
-	resolved := make(map[string]bool)
+	queue := make([]string, 0, len(dag.nodes))
 
-	for len(resolved) < len(dag.nodes) {
-		var layer []string
-		for id, deg := range inDegree {
-			if deg == 0 && !resolved[id] {
-				layer = append(layer, id)
-			}
+	// 初始化队列：入度为 0 的节点
+	for id, deg := range inDegree {
+		if deg == 0 {
+			queue = append(queue, id)
 		}
-		if len(layer) == 0 {
-			return nil, fmt.Errorf("circular dependency detected in task graph")
-		}
+	}
+
+	processed := 0
+	for len(queue) > 0 {
+		layer := queue
+		queue = make([]string, 0, len(dag.nodes))
+
 		for _, id := range layer {
-			resolved[id] = true
+			processed++
 			// 减少依赖此节点的其他节点的入度
-			for otherID, node := range dag.nodes {
-				for _, dep := range node.DependsOn {
-					if dep == id {
-						inDegree[otherID]--
-					}
+			for _, dependent := range adjList[id] {
+				inDegree[dependent]--
+				if inDegree[dependent] == 0 {
+					queue = append(queue, dependent)
 				}
 			}
 		}
 		layers = append(layers, layer)
+	}
+
+	if processed < len(dag.nodes) {
+		return nil, fmt.Errorf("circular dependency detected in task graph")
 	}
 
 	dag.order = layers
