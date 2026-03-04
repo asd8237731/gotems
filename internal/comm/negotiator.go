@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lyymini/gotems/pkg/schema"
@@ -16,23 +17,24 @@ type Negotiator struct {
 	mu       sync.RWMutex
 	mailbox  *Mailbox
 	pending  map[string]chan *schema.Message // questionID -> answer channel
-	timeout  time.Duration
+	timeout  atomic.Int64                    // 纳秒，线程安全
 	logger   *slog.Logger
 }
 
 // NewNegotiator 创建协商器
 func NewNegotiator(mailbox *Mailbox, logger *slog.Logger) *Negotiator {
-	return &Negotiator{
+	n := &Negotiator{
 		mailbox: mailbox,
 		pending: make(map[string]chan *schema.Message),
-		timeout: 30 * time.Second,
 		logger:  logger,
 	}
+	n.timeout.Store(int64(30 * time.Second))
+	return n
 }
 
-// SetTimeout 设置协商超时时间
+// SetTimeout 设置协商超时时间（线程安全）
 func (n *Negotiator) SetTimeout(d time.Duration) {
-	n.timeout = d
+	n.timeout.Store(int64(d))
 }
 
 // Ask 向目标 Agent 发送问题并等待回答
@@ -76,7 +78,8 @@ func (n *Negotiator) Ask(ctx context.Context, from, to, question string) (string
 	)
 
 	// 等待回答
-	timeoutCtx, cancel := context.WithTimeout(ctx, n.timeout)
+	timeout := time.Duration(n.timeout.Load())
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	select {

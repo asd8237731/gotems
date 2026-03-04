@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sync/atomic"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -60,7 +61,7 @@ func NewGeminiAgent(id string, logger *slog.Logger, opts ...GeminiOption) *Gemin
 				CapMultimodal, CapLargeContext, CapCodeGen, CapReasoning,
 			},
 			InboxCh:   make(chan *schema.Message, 50),
-			StatusVal: StatusIdle,
+			StatusVal: atomic.Int32{},
 		},
 		cliPath:     "gemini",
 		autoApprove: true,
@@ -75,7 +76,7 @@ func NewGeminiAgent(id string, logger *slog.Logger, opts ...GeminiOption) *Gemin
 }
 
 func (a *GeminiAgent) Start(_ context.Context) error {
-	a.StatusVal = StatusIdle
+	a.SetStatus(StatusIdle)
 	a.logger.Info("gemini agent started",
 		"id", a.AgentID,
 		"model", a.ModelID,
@@ -85,15 +86,15 @@ func (a *GeminiAgent) Start(_ context.Context) error {
 }
 
 func (a *GeminiAgent) Stop(_ context.Context) error {
-	a.StatusVal = StatusStopped
+	a.SetStatus(StatusStopped)
 	a.procManager.StopAll()
 	a.logger.Info("gemini agent stopped", "id", a.AgentID)
 	return nil
 }
 
 func (a *GeminiAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result, error) {
-	a.StatusVal = StatusBusy
-	defer func() { a.StatusVal = StatusIdle }()
+	a.SetStatus(StatusBusy)
+	defer func() { a.SetStatus(StatusIdle) }()
 
 	start := time.Now()
 	switch a.mode {

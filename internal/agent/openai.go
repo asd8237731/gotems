@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sync/atomic"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -60,7 +61,7 @@ func NewOpenAIAgent(id string, logger *slog.Logger, opts ...OpenAIOption) *OpenA
 				CapCodeGen, CapTestGen, CapQuickTask,
 			},
 			InboxCh:   make(chan *schema.Message, 50),
-			StatusVal: StatusIdle,
+			StatusVal: atomic.Int32{},
 		},
 		cliPath:     "codex",
 		autoApprove: true,
@@ -75,7 +76,7 @@ func NewOpenAIAgent(id string, logger *slog.Logger, opts ...OpenAIOption) *OpenA
 }
 
 func (a *OpenAIAgent) Start(_ context.Context) error {
-	a.StatusVal = StatusIdle
+	a.SetStatus(StatusIdle)
 	a.logger.Info("openai agent started",
 		"id", a.AgentID,
 		"model", a.ModelID,
@@ -85,15 +86,15 @@ func (a *OpenAIAgent) Start(_ context.Context) error {
 }
 
 func (a *OpenAIAgent) Stop(_ context.Context) error {
-	a.StatusVal = StatusStopped
+	a.SetStatus(StatusStopped)
 	a.procManager.StopAll()
 	a.logger.Info("openai agent stopped", "id", a.AgentID)
 	return nil
 }
 
 func (a *OpenAIAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result, error) {
-	a.StatusVal = StatusBusy
-	defer func() { a.StatusVal = StatusIdle }()
+	a.SetStatus(StatusBusy)
+	defer func() { a.SetStatus(StatusIdle) }()
 
 	start := time.Now()
 	switch a.mode {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/lyymini/gotems/internal/agent"
@@ -19,6 +20,7 @@ import (
 
 // Orchestrator 是 GoTems 的核心编排引擎
 type Orchestrator struct {
+	mu          sync.RWMutex // 保护 agents map
 	agents      map[string]agent.Agent
 	taskPool    *task.Pool
 	fileLock    *task.FileLock
@@ -106,8 +108,10 @@ func (o *Orchestrator) ConfigureRateLimit(cfg ratelimit.LimiterConfig) {
 	o.limiter.Configure(cfg)
 }
 
-// RegisterAgent 注册一个 Agent 到编排器
+// RegisterAgent 注册一个 Agent 到编排器（线程安全）
 func (o *Orchestrator) RegisterAgent(a agent.Agent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.agents[a.ID()] = a
 	o.router.agents[a.ID()] = a
 	o.mailbox.Register(a.ID())
@@ -119,25 +123,50 @@ func (o *Orchestrator) RegisterAgent(a agent.Agent) {
 	)
 }
 
-// Start 启动所有已注册的 Agent
+// Start 启动所有已注册的 Agent（失败时回滚已启动的 Agent）
 func (o *Orchestrator) Start(ctx context.Context) error {
+	o.mu.RLock()
+	agents := make([]agent.Agent, 0, len(o.agents))
 	for _, a := range o.agents {
+		agents = append(agents, a)
+	}
+	o.mu.RUnlock()
+
+	started := make([]agent.Agent, 0, len(agents))
+	for _, a := range agents {
 		if err := a.Start(ctx); err != nil {
+			// 回滚已启动的 Agent
+			for _, s := range started {
+				_ = s.Stop(ctx)
+			}
 			return fmt.Errorf("start agent %s: %w", a.ID(), err)
 		}
+		started = append(started, a)
 	}
-	o.logger.Info("orchestrator started", "agents", len(o.agents))
+	o.logger.Info("orchestrator started", "agents", len(agents))
 	return nil
 }
 
-// Stop 停止所有 Agent，清理 Workspace
+// Stop 停止所有 Agent，关闭 Tracer，清理 Workspace
 func (o *Orchestrator) Stop(ctx context.Context) error {
+	o.mu.RLock()
+	agents := make([]agent.Agent, 0, len(o.agents))
 	for _, a := range o.agents {
+		agents = append(agents, a)
+	}
+	o.mu.RUnlock()
+
+	for _, a := range agents {
 		if err := a.Stop(ctx); err != nil {
 			o.logger.Warn("failed to stop agent", "id", a.ID(), "error", err)
 		}
 	}
 	o.mailbox.Close()
+	if o.tracer != nil {
+		if err := o.tracer.Shutdown(ctx); err != nil {
+			o.logger.Warn("failed to shutdown tracer", "error", err)
+		}
+	}
 	if o.workspace != nil {
 		o.workspace.Cleanup()
 	}
@@ -317,13 +346,21 @@ func (o *Orchestrator) SetTracer(t *observability.Tracer) {
 	o.guard.SetTracer(t)
 }
 
-// AgentsMap 返回 Agent 映射
+// AgentsMap 返回 Agent 映射的副本（防止外部修改）
 func (o *Orchestrator) AgentsMap() map[string]agent.Agent {
-	return o.agents
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	copy := make(map[string]agent.Agent, len(o.agents))
+	for k, v := range o.agents {
+		copy[k] = v
+	}
+	return copy
 }
 
 // Agents 返回所有已注册 Agent 的状态快照
 func (o *Orchestrator) Agents() []AgentInfo {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	infos := make([]AgentInfo, 0, len(o.agents))
 	for _, a := range o.agents {
 		infos = append(infos, AgentInfo{

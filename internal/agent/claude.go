@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sync/atomic"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -66,7 +67,7 @@ func NewClaudeAgent(id string, logger *slog.Logger, opts ...ClaudeOption) *Claud
 				CapReasoning, CapCodeReview, CapRefactor, CapCodeGen, CapLargeContext,
 			},
 			InboxCh:   make(chan *schema.Message, 50),
-			StatusVal: StatusIdle,
+			StatusVal: atomic.Int32{},
 		},
 		cliPath:     "claude",
 		autoApprove: true, // 默认自动审批，编排器场景无人交互
@@ -82,7 +83,7 @@ func NewClaudeAgent(id string, logger *slog.Logger, opts ...ClaudeOption) *Claud
 }
 
 func (a *ClaudeAgent) Start(_ context.Context) error {
-	a.StatusVal = StatusIdle
+	a.SetStatus(StatusIdle)
 	a.logger.Info("claude agent started",
 		"id", a.AgentID,
 		"model", a.ModelID,
@@ -93,15 +94,15 @@ func (a *ClaudeAgent) Start(_ context.Context) error {
 }
 
 func (a *ClaudeAgent) Stop(_ context.Context) error {
-	a.StatusVal = StatusStopped
+	a.SetStatus(StatusStopped)
 	a.procManager.StopAll()
 	a.logger.Info("claude agent stopped", "id", a.AgentID)
 	return nil
 }
 
 func (a *ClaudeAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result, error) {
-	a.StatusVal = StatusBusy
-	defer func() { a.StatusVal = StatusIdle }()
+	a.SetStatus(StatusBusy)
+	defer func() { a.SetStatus(StatusIdle) }()
 
 	start := time.Now()
 	switch a.mode {

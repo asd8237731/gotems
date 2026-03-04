@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/lyymini/gotems/internal/task"
 	"github.com/lyymini/gotems/pkg/schema"
@@ -33,7 +34,7 @@ const (
 )
 
 // Status 是 Agent 的运行状态
-type Status int
+type Status int32
 
 const (
 	StatusIdle    Status = iota // 空闲
@@ -90,15 +91,18 @@ type BaseAgent struct {
 	ModelID      string
 	Caps         []Capability
 	InboxCh      chan *schema.Message
-	StatusVal    Status
+	StatusVal    atomic.Int32 // 原子操作，线程安全
 }
 
-func (b *BaseAgent) ID() string              { return b.AgentID }
-func (b *BaseAgent) Provider() ProviderType   { return b.ProviderType }
-func (b *BaseAgent) Model() string            { return b.ModelID }
-func (b *BaseAgent) Capabilities() []Capability { return b.Caps }
-func (b *BaseAgent) Inbox() <-chan *schema.Message { return b.InboxCh }
-func (b *BaseAgent) Status() Status           { return b.StatusVal }
+func (b *BaseAgent) ID() string                    { return b.AgentID }
+func (b *BaseAgent) Provider() ProviderType         { return b.ProviderType }
+func (b *BaseAgent) Model() string                  { return b.ModelID }
+func (b *BaseAgent) Capabilities() []Capability     { return b.Caps }
+func (b *BaseAgent) Inbox() <-chan *schema.Message   { return b.InboxCh }
+func (b *BaseAgent) Status() Status                 { return Status(b.StatusVal.Load()) }
+
+// SetStatus 线程安全地设置状态
+func (b *BaseAgent) SetStatus(s Status) { b.StatusVal.Store(int32(s)) }
 
 func (b *BaseAgent) Send(ctx context.Context, msg *schema.Message) error {
 	select {

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sync/atomic"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -38,7 +39,7 @@ func NewOllamaAgent(id string, logger *slog.Logger, opts ...OllamaOption) *Ollam
 				CapQuickTask, CapCodeGen,
 			},
 			InboxCh:   make(chan *schema.Message, 50),
-			StatusVal: StatusIdle,
+			StatusVal: atomic.Int32{},
 		},
 		baseURL:    "http://localhost:11434",
 		httpClient: &http.Client{Timeout: 10 * time.Minute},
@@ -51,20 +52,20 @@ func NewOllamaAgent(id string, logger *slog.Logger, opts ...OllamaOption) *Ollam
 }
 
 func (a *OllamaAgent) Start(_ context.Context) error {
-	a.StatusVal = StatusIdle
+	a.SetStatus(StatusIdle)
 	a.logger.Info("ollama agent started", "id", a.AgentID, "model", a.ModelID, "base_url", a.baseURL)
 	return nil
 }
 
 func (a *OllamaAgent) Stop(_ context.Context) error {
-	a.StatusVal = StatusStopped
+	a.SetStatus(StatusStopped)
 	a.logger.Info("ollama agent stopped", "id", a.AgentID)
 	return nil
 }
 
 func (a *OllamaAgent) Execute(ctx context.Context, t *task.Task) (*schema.Result, error) {
-	a.StatusVal = StatusBusy
-	defer func() { a.StatusVal = StatusIdle }()
+	a.SetStatus(StatusBusy)
+	defer func() { a.SetStatus(StatusIdle) }()
 
 	start := time.Now()
 

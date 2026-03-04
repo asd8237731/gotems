@@ -40,20 +40,21 @@ func (m *mockAgent) Stream(_ context.Context, _ *task.Task) (<-chan schema.Strea
 	return ch, nil
 }
 
-func (m *mockAgent) Start(_ context.Context) error { m.StatusVal = agent.StatusIdle; return nil }
-func (m *mockAgent) Stop(_ context.Context) error  { m.StatusVal = agent.StatusStopped; return nil }
+func (m *mockAgent) Start(_ context.Context) error { m.SetStatus(agent.StatusIdle); return nil }
+func (m *mockAgent) Stop(_ context.Context) error  { m.SetStatus(agent.StatusStopped); return nil }
 
 func newMockAgent(id string, provider agent.ProviderType, model string) *mockAgent {
-	return &mockAgent{
+	m := &mockAgent{
 		BaseAgent: agent.BaseAgent{
 			AgentID:      id,
 			ProviderType: provider,
 			ModelID:      model,
 			Caps:         []agent.Capability{agent.CapCodeGen},
 			InboxCh:      make(chan *schema.Message, 50),
-			StatusVal:    agent.StatusIdle,
 		},
 	}
+	m.SetStatus(agent.StatusIdle)
+	return m
 }
 
 func testLogger() *slog.Logger {

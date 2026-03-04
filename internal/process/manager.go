@@ -73,16 +73,20 @@ type Process struct {
 	startTime time.Time
 	stopTime  time.Time
 	output    []OutputLine // 缓存输出
+	waitOnce  sync.Once    // 确保 cmd.Wait() 只调用一次
+	waitErr   error        // cmd.Wait() 的返回值
+	waitDone  chan struct{} // Wait 完成信号
 	logger    *slog.Logger
 }
 
 // NewProcess 创建子进程封装
 func NewProcess(cfg Config, logger *slog.Logger) *Process {
 	return &Process{
-		cfg:    cfg,
-		state:  StateIdle,
-		output: make([]OutputLine, 0, 256),
-		logger: logger,
+		cfg:      cfg,
+		state:    StateIdle,
+		output:   make([]OutputLine, 0, 256),
+		waitDone: make(chan struct{}),
+		logger:   logger,
 	}
 }
 
@@ -139,6 +143,9 @@ func (p *Process) Start(ctx context.Context) error {
 	p.startTime = time.Now()
 	p.state = StateRunning
 	p.output = p.output[:0]
+	// 重置 waitOnce 和 waitDone（支持重复 Start）
+	p.waitOnce = sync.Once{}
+	p.waitDone = make(chan struct{})
 
 	p.logger.Info("process started",
 		"binary", p.cfg.Binary,
@@ -149,15 +156,21 @@ func (p *Process) Start(ctx context.Context) error {
 	return nil
 }
 
+// doWait 内部方法，确保 cmd.Wait() 只调用一次
+func (p *Process) doWait() {
+	p.waitOnce.Do(func() {
+		p.waitErr = p.cmd.Wait()
+		close(p.waitDone)
+	})
+}
+
 // Stop 优雅停止子进程
 func (p *Process) Stop() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.state != StateRunning {
+		p.mu.Unlock()
 		return nil
 	}
-
 	p.state = StateStopping
 
 	// 先关闭 stdin
@@ -169,28 +182,37 @@ func (p *Process) Stop() error {
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Signal(os.Interrupt)
 	}
+	p.mu.Unlock()
 
-	// 等待退出（最多 5 秒，否则 kill）
-	done := make(chan error, 1)
-	go func() {
-		done <- p.cmd.Wait()
-	}()
+	// 不持锁等待，避免阻塞所有操作
+	go p.doWait()
 
 	select {
-	case err := <-done:
+	case <-p.waitDone:
+		p.mu.Lock()
 		p.stopTime = time.Now()
 		p.state = StateStopped
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
+		if p.waitErr != nil {
+			if exitErr, ok := p.waitErr.(*exec.ExitError); ok {
 				p.exitCode = exitErr.ExitCode()
 			}
 		}
+		p.mu.Unlock()
 		p.logger.Info("process stopped", "pid", p.pid, "exit_code", p.exitCode)
 		return nil
 	case <-time.After(5 * time.Second):
-		_ = p.cmd.Process.Kill()
+		p.mu.RLock()
+		cmd := p.cmd
+		p.mu.RUnlock()
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		// 等待 kill 生效
+		<-p.waitDone
+		p.mu.Lock()
 		p.stopTime = time.Now()
 		p.state = StateStopped
+		p.mu.Unlock()
 		p.logger.Warn("process killed after timeout", "pid", p.pid)
 		return nil
 	}
@@ -285,7 +307,7 @@ func (p *Process) CollectOutput(ctx context.Context) (string, string, error) {
 	return string(stdoutBuf), string(stderrBuf), nil
 }
 
-// Wait 等待子进程退出
+// Wait 等待子进程退出（线程安全，可被多个 goroutine 调用）
 func (p *Process) Wait() error {
 	p.mu.RLock()
 	cmd := p.cmd
@@ -295,19 +317,21 @@ func (p *Process) Wait() error {
 		return fmt.Errorf("process not started")
 	}
 
-	err := cmd.Wait()
+	// 通过 doWait 确保 cmd.Wait() 只调用一次
+	go p.doWait()
+	<-p.waitDone
 
 	p.mu.Lock()
 	p.stopTime = time.Now()
 	p.state = StateStopped
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if p.waitErr != nil {
+		if exitErr, ok := p.waitErr.(*exec.ExitError); ok {
 			p.exitCode = exitErr.ExitCode()
 		}
 	}
 	p.mu.Unlock()
 
-	return err
+	return p.waitErr
 }
 
 // State 返回当前状态

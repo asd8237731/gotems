@@ -36,39 +36,40 @@ var defaultPricing = map[string]ModelPricing{
 
 // Tracker 追踪各 Agent 和模型的 Token 消耗与费用
 type Tracker struct {
-	mu      sync.RWMutex
-	records []Record
-	daily   map[string]float64 // date -> cost
-	pricing map[string]ModelPricing
-	limits  Limits
-	logger  *slog.Logger
+	mu         sync.RWMutex
+	records    []Record
+	daily      map[string]float64 // date -> cost
+	pricing    map[string]ModelPricing
+	limits     Limits
+	maxRecords int // records 最大容量，超过后清理旧记录
+	logger     *slog.Logger
 }
 
 // Record 记录一次 API 调用的消耗
 type Record struct {
-	AgentID    string    `json:"agent_id"`
-	Provider   string    `json:"provider"`
-	Model      string    `json:"model"`
-	TokensIn   int       `json:"tokens_in"`
-	TokensOut  int       `json:"tokens_out"`
-	Cost       float64   `json:"cost"`
-	Timestamp  time.Time `json:"timestamp"`
+	AgentID   string    `json:"agent_id"`
+	Provider  string    `json:"provider"`
+	Model     string    `json:"model"`
+	TokensIn  int       `json:"tokens_in"`
+	TokensOut int       `json:"tokens_out"`
+	Cost      float64   `json:"cost"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // Limits 费用限制
 type Limits struct {
-	DailyMax  float64
+	DailyMax   float64
 	PerTaskMax float64
 }
 
 // Summary 汇总统计
 type Summary struct {
-	TotalCost     float64            `json:"total_cost"`
-	TotalTokensIn  int              `json:"total_tokens_in"`
-	TotalTokensOut int              `json:"total_tokens_out"`
-	ByProvider    map[string]float64 `json:"by_provider"`
-	ByModel       map[string]float64 `json:"by_model"`
-	RecordCount   int                `json:"record_count"`
+	TotalCost      float64            `json:"total_cost"`
+	TotalTokensIn  int                `json:"total_tokens_in"`
+	TotalTokensOut int                `json:"total_tokens_out"`
+	ByProvider     map[string]float64 `json:"by_provider"`
+	ByModel        map[string]float64 `json:"by_model"`
+	RecordCount    int                `json:"record_count"`
 }
 
 // NewTracker 创建费用追踪器
@@ -79,11 +80,19 @@ func NewTracker(limits Limits, logger *slog.Logger) *Tracker {
 		pricing[k] = v
 	}
 	return &Tracker{
-		daily:   make(map[string]float64),
-		pricing: pricing,
-		limits:  limits,
-		logger:  logger,
+		daily:      make(map[string]float64),
+		pricing:    pricing,
+		limits:     limits,
+		maxRecords: 10000, // 默认最多保留 10000 条记录
+		logger:     logger,
 	}
+}
+
+// SetMaxRecords 设置 records 最大容量
+func (t *Tracker) SetMaxRecords(max int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxRecords = max
 }
 
 // RegisterPricing 注册或覆盖模型定价
@@ -125,8 +134,21 @@ func (t *Tracker) Track(r Record) error {
 		return fmt.Errorf("daily cost limit exceeded: %.2f / %.2f", todayCost, t.limits.DailyMax)
 	}
 
+	// 检查单任务限额
+	if t.limits.PerTaskMax > 0 && r.Cost > t.limits.PerTaskMax {
+		return fmt.Errorf("per-task cost limit exceeded: %.2f / %.2f", r.Cost, t.limits.PerTaskMax)
+	}
+
 	t.records = append(t.records, r)
 	t.daily[dateKey] = todayCost
+
+	// 清理旧记录（保留最近的 maxRecords 条）
+	if len(t.records) > t.maxRecords {
+		// 保留后 80% 的记录
+		keep := int(float64(t.maxRecords) * 0.8)
+		t.records = t.records[len(t.records)-keep:]
+		t.logger.Info("cost records trimmed", "kept", keep, "max", t.maxRecords)
+	}
 
 	t.logger.Info("cost tracked",
 		"agent_id", r.AgentID,
@@ -184,7 +206,9 @@ func (t *Tracker) FetchPricing(ctx context.Context, endpoint string) error {
 		} `json:"models"`
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 限制 Body 大小为 1MB
+	limitedBody := io.LimitReader(resp.Body, 1024*1024)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
 		return fmt.Errorf("read pricing response: %w", err)
 	}
@@ -226,8 +250,8 @@ func (t *Tracker) Summarize() Summary {
 	defer t.mu.RUnlock()
 
 	s := Summary{
-		ByProvider: make(map[string]float64),
-		ByModel:    make(map[string]float64),
+		ByProvider:  make(map[string]float64),
+		ByModel:     make(map[string]float64),
 		RecordCount: len(t.records),
 	}
 	for _, r := range t.records {

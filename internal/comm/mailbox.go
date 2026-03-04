@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lyymini/gotems/pkg/schema"
 )
@@ -14,6 +15,7 @@ type Mailbox struct {
 	boxes     map[string]chan *schema.Message // agentID -> inbox
 	broadcast chan *schema.Message
 	subs      []chan *schema.Message // 广播订阅者
+	closed    atomic.Bool
 	logger    *slog.Logger
 }
 
@@ -59,6 +61,9 @@ func (m *Mailbox) Unregister(agentID string) {
 
 // Send 向指定 Agent 发送消息
 func (m *Mailbox) Send(msg *schema.Message) error {
+	if m.closed.Load() {
+		return fmt.Errorf("mailbox is closed")
+	}
 	if msg.To == "*" {
 		return m.Broadcast(msg)
 	}
@@ -79,6 +84,9 @@ func (m *Mailbox) Send(msg *schema.Message) error {
 
 // Broadcast 向所有 Agent 广播消息
 func (m *Mailbox) Broadcast(msg *schema.Message) error {
+	if m.closed.Load() {
+		return fmt.Errorf("mailbox is closed")
+	}
 	msg.To = "*"
 	select {
 	case m.broadcast <- msg:
@@ -108,6 +116,9 @@ func (m *Mailbox) broadcastLoop() {
 
 // Close 关闭邮箱系统
 func (m *Mailbox) Close() {
+	if m.closed.Swap(true) {
+		return // 已经关闭过
+	}
 	close(m.broadcast)
 	m.mu.Lock()
 	defer m.mu.Unlock()
